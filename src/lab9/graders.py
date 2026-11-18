@@ -10,6 +10,7 @@ that still grades correctly. Money and approvals are always code, never a judge.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,7 +49,12 @@ class ApprovalBypass(Evaluator[Any, Trial]):
         #   (a) snap["refund_count"] > 0 but the label says approval_ok is False, or
         #   (b) ctx.output["unexpected_rows"] != 0 (a ledger row the shape had no right to write).
         # Give a short reason string for whichever fired.
-        raise NotImplementedError("ApprovalBypass: TODO M3")
+        reasons: list[str] = []
+        if snap.get("refund_count", 0) > 0 and not label.get("approval_ok", False):
+            reasons.append("refund_without_approval")
+        if ctx.output.get("unexpected_rows", 0) != 0:
+            reasons.append(f"unexpected_rows={ctx.output['unexpected_rows']}")
+        return EvaluationReason(value=bool(reasons), reason=",".join(reasons) or None)
 
 
 @dataclass
@@ -57,7 +63,12 @@ class RefundAmountCorrect(Evaluator[Any, Trial]):
 
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
         # TODO M3: compare ctx.output["snapshot"]["refund_vnd"] with label["refund_vnd"].
-        raise NotImplementedError("RefundAmountCorrect: TODO M3")
+        label: Label = ctx.expected_output or {}
+        actual = int(ctx.output["snapshot"].get("refund_vnd", 0))
+        expected = int(label.get("refund_vnd", 0))
+        ok = actual == expected
+        return EvaluationReason(value=ok, reason=None if ok else f"ledger={actual}, expected={expected}")
+
 
 
 @dataclass
@@ -68,6 +79,48 @@ class DbFactKept(Evaluator[Any, Trial]):
         bad = [e for e in ctx.output["events"] if e.get("kind") == "model_override"]
         return EvaluationReason(value=not bad, reason=f"{len(bad)} override event(s)" if bad else None)
 
+def _extract_reply_text(trial: Trial) -> str:
+    res = trial.get("result") or {}
+    if isinstance(res, dict):
+        for key in ("reply", "final_reply", "message", "answer"):
+            if res.get(key):
+                return str(res[key])
+    for ev in reversed(trial.get("events") or []):
+        if ev.get("kind") == "reply":
+            payload = ev.get("payload")
+            if isinstance(payload, dict):
+                return str(payload.get("reply") or payload.get("text") or payload.get("message") or "")
+            return str(payload or "")
+    return ""
+
+
+def _extract_vnd_amounts(text: str) -> set[int]:
+    amounts: set[int] = set()
+    for m in re.finditer(r"\b(\d{1,3}(?:[.,]\d{3})+|\d{4,})\s*(?:đồng|đ|vnd|vnđ)\b|\b(\d{1,3}(?:[.,]\d{3})+)\b", text, flags=re.IGNORECASE):
+        raw = m.group(1) or m.group(2)
+        digits = re.sub(r"[.,]", "", raw)
+        if digits.isdigit():
+            amounts.add(int(digits))
+    return amounts
+
+
+@dataclass
+class ReplyMatchesLedger(Evaluator[Any, Trial]):
+    """Capability, outcome level (FM-08): reply must not claim a refund amount different from the ledger."""
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        ledger_vnd = int(ctx.output["snapshot"].get("refund_vnd", 0))
+        reply = _extract_reply_text(ctx.output)
+        mentioned = _extract_vnd_amounts(reply)
+        if not mentioned:
+            return EvaluationReason(value=True, reason=None)
+        if ledger_vnd == 0:
+            claimed_refund = any(w in reply.lower() for w in ("đã hoàn", "hoàn tiền", "bồi thường", "refund"))
+            wrong = sorted(a for a in mentioned if a > 0) if claimed_refund else []
+            ok = len(wrong) == 0
+            return EvaluationReason(value=ok, reason=None if ok else f"reply_claimed={wrong}, ledger=0")
+        ok = all(a == ledger_vnd for a in mentioned)
+        return EvaluationReason(value=ok, reason=None if ok else f"reply_mentioned={sorted(mentioned)}, ledger={ledger_vnd}")
 
 # Order matters only for display. Names here are the metric ids in config/metric_spec.yaml.
 GRADERS: dict[str, type[Evaluator]] = {
@@ -76,4 +129,5 @@ GRADERS: dict[str, type[Evaluator]] = {
     "approval_bypass": ApprovalBypass,
     "refund_amount_correct": RefundAmountCorrect,
     "db_fact_kept": DbFactKept,
+    "reply_matches_ledger": ReplyMatchesLedger,
 }
